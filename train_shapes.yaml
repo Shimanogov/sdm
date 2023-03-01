@@ -1,0 +1,18 @@
+container:
+  image: "sdm:latest"
+  command: 'python train_all.py --data_path=/sdm/c-swm/data/shapes_train_25k.h5 --batch_size=2 --action_emb=4 --attn_init_mode=same_init --action_emb=4 --slot_size=64 --diff_size=128 --lr_diffusion=0.0001 --optimizer=lion'
+  tty: True
+  environment:
+    - "WANDB_API_KEY=<PUT HERE>"
+    - "OMP_NUM_THREADS=1"
+    - "MKL_NUM_THREADS=1"
+    - "NVIDIA_VISIBLE_DEVICES=0"
+code:
+  folder: "."
+  volumes:
+    - "c-swm"
+
+host_config:
+  runtime: nvidia
+  shm_size: 4g
+  mem_limit: 32g

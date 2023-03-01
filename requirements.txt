@@ -1,0 +1,8 @@
+numpy
+gym==0.12.0
+scikit-image
+matplotlib
+h5py
+wandb
+tqdm
+einops
