@@ -29,7 +29,7 @@ class CswmStyleDataset(Dataset):
             img = np.array(f[str(int(self.start+index))]['obs'][:self.traj_size])
             action = np.array(f[str(int(self.start+index))]['action'][:self.traj_size])
             if self.reward:
-                reward = np.array(f[str(int(self.start+index))]['reward'][:self.traj_size])
+                reward = np.sum(np.array(f[str(int(self.start+index))]['reward'][:self.traj_size]))[None] # TODO discount
                 return img, action, reward
             return img, action
 

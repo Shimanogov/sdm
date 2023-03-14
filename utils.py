@@ -2,6 +2,7 @@ import math
 
 import einops
 import torch
+from torch import nn
 from torch.optim.optimizer import Optimizer
 
 
@@ -111,3 +112,30 @@ def cosine_anneal(step, start_value, final_value, start_step, final_step):
         value = a * math.cos(math.pi * progress) + b
 
     return value
+
+class ActionsAutoencoder(nn.Module):
+    def __init__(self, action_emb):
+        super(ActionsAutoencoder, self).__init__()
+        self.mu = nn.Embedding(20, action_emb, max_norm=1)
+        self.sigma = nn.Embedding(20, action_emb, max_norm=1)
+        self.N = torch.distributions.Normal(0, 1)
+        self.N.loc = self.N.loc.cuda()
+        self.N.scale = self.N.scale.cuda()
+        self.reverse = nn.Linear(action_emb, 20)
+        self.result = nn.Softmax(20)
+        self.crossent = nn.CrossEntropyLoss()
+
+    def forward(self, x):
+        mu = self.mu(x)
+        sigma = torch.exp(self.sigma(x))
+        z = mu + sigma * self.N.sample(mu.shape)
+        kl = (sigma ** 2 + mu ** 2 - torch.log(sigma) - 1 / 2).sum()
+        return z, kl
+
+    def encode(self, x):
+        return self.mu(x)
+
+    def loss(self, x):
+        z, kl = self.forward(x)
+        loss = self.crossent(x, z)
+        return loss, kl

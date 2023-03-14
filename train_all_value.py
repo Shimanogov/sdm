@@ -1,18 +1,28 @@
 import argparse
 import math
 
+import gym
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
 from utils import Lion, to_4d, to_diff4d, linear_warmup, cosine_anneal
 from torch.utils.data import DataLoader
 import wandb
-from diffusion.diffusions.gaussian import GaussianDiffusion
+from diffusion.diffusions.gaussian import GaussianDiffusion, GuidedGaussianDiffusion
 from diffusion.models.unet import TemporalUnet
+from diffusion.models.value import ValueFunction
 import torchvision.utils as vutils
 
 from slate.shapes_2d import CswmStyleDataset as Shapes2Dtraj # look
 from slate.slate import SLATE
+
+import numpy as np
+from PIL import Image
+
+def crop_normalize(img, crop_ratio):
+    img = img[crop_ratio[0]:crop_ratio[1]]
+    img = Image.fromarray(img).resize((64, 64), Image.ANTIALIAS)
+    return np.transpose(np.array(img), (2, 0, 1)) / 255
 
 def to_5d(batch):
     return torch.unflatten(batch, 0, (-1, args.traj_size))
@@ -69,9 +79,9 @@ if __name__ == '__main__':
 
     # First, lets load batch of traj
     print('Started loading data')
-    train_dataset = Shapes2Dtraj(root=args.data_path, phase='train', traj_size=args.traj_size)
+    train_dataset = Shapes2Dtraj(root=args.data_path, phase='train', traj_size=args.traj_size, reward=True)
     print('Train data loaded')
-    val_dataset = Shapes2Dtraj(root=args.data_path, phase='val', traj_size=args.traj_size)
+    val_dataset = Shapes2Dtraj(root=args.data_path, phase='val', traj_size=args.traj_size, reward=True)
     print('Loaded data')
     print(len(train_dataset))
     # train_dataset is np array (#taj, #obs(96), 3, 64, 64)
@@ -86,7 +96,6 @@ if __name__ == '__main__':
     }
 
     train_loader = DataLoader(train_dataset, sampler=None, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, sampler=None, **loader_kwargs)
     train_epoch_size = len(train_loader)
 
     # start params
@@ -102,7 +111,10 @@ if __name__ == '__main__':
     # creating diffusion
     action_embedding = torch.nn.Embedding(20, args.action_emb, max_norm=1, device='cuda')
     model = TemporalUnet(args.traj_size, args.slot_size + args.action_emb, dim=args.diff_size)
+    value = ValueFunction(args.traj_size, args.num_slots * args.slot_size + args.action_emb,
+                          dim=2 * args.diff_size)  # TODO params
     diffusion = GaussianDiffusion(model, n_timesteps=args.n_timesteps, device='cuda')
+    value_diffusion = GuidedGaussianDiffusion(value, n_timesteps=args.n_timesteps, device='cuda')
 
     # creating optimizer
     if args.optimizer == 'adam':
@@ -115,7 +127,8 @@ if __name__ == '__main__':
         {'params': (x[1] for x in slate.named_parameters() if 'dvae' in x[0]), 'lr': args.lr_dvae},
         {'params': (x[1] for x in slate.named_parameters() if 'dvae' not in x[0]), 'lr': args.lr_main},
         {'params': diffusion.model.parameters(), 'lr': args.lr_diffusion},
-        {'params': action_embedding.parameters(), 'lr': args.lr_action_emb}
+        {'params': action_embedding.parameters(), 'lr': args.lr_action_emb},
+        {'params': value_diffusion.model.parameters(), 'lr': args.lr_diffusion}, # TODO SEPARATE
     ])
 
     # starting wandb
@@ -129,11 +142,12 @@ if __name__ == '__main__':
     global_slate_step = 0
     slate.train()
     model.train()
+    value.train()
     while True:
         if global_slate_step > args.max_steps:
             break
         epoch += 1
-        for traj_batch, (trajs, actions) in enumerate(train_loader):
+        for traj_batch, (trajs, actions, rew) in enumerate(train_loader):
             wandb_logs = {}
             global_slate_step = (epoch * train_epoch_size + traj_batch) * args.traj_size * args.batch_size
             # calculate training constants
@@ -171,6 +185,7 @@ if __name__ == '__main__':
             optimizer.param_groups[3]['lr'] = lr_decay_factor * args.lr_action_emb * lr_global_decay
             optimizer.param_groups[1]['lr'] = lr_decay_factor * lr_warmup_factor * args.lr_main * lr_global_decay
             optimizer.param_groups[2]['lr'] = lr_decay_factor * lr_diffusion_warmup_factor * args.lr_diffusion * lr_global_decay
+            optimizer.param_groups[4]['lr'] = lr_decay_factor * lr_diffusion_warmup_factor * args.lr_diffusion * lr_global_decay # TODO SEPARATE
 
             wandb_logs['TRAIN/lr/tau'] = tau
             wandb_logs['TRAIN/lr/dvae'] = optimizer.param_groups[0]['lr']
@@ -191,15 +206,21 @@ if __name__ == '__main__':
             wandb_logs['TRAIN/losses/slate_cross_entropy'] = cross_entropy
             # prepare slots for diffusion
             slots = to_5d(slots)
+            value_slots = slots.flatten(-2, -1)
             actions = actions.to('cuda')
             actions = action_embedding(actions)
+            value_slots = torch.cat([value_slots, actions], dim=-1)
             actions = torch.unsqueeze(actions, -2)
             actions = actions.expand(-1, -1, args.num_slots, -1)
             slots = torch.cat([slots, actions], dim=-1)
             slots = to_diff4d(slots)
+            rew = rew.to(torch.float)
+            rew = rew.to('cuda')
             # TODO: ADD NORM ?
             # pass to diffusion
             diffusion_mse = diffusion.loss(slots)
+            value_mse = value_diffusion.loss(value_slots, rew)
+            wandb_logs['TRAIN/losses/value_loss'] = value_mse
             wandb_logs['TRAIN/losses/diffusion_loss'] = diffusion_mse
             # TODO: weight losses actions
 
@@ -208,12 +229,15 @@ if __name__ == '__main__':
             wandb_logs['TRAIN/losses/slate_loss'] = mse + cross_entropy
             if not args.no_diff_loss:
                 loss += diffusion_mse
+                loss += value_mse
             wandb_logs['TRAIN/losses/loss'] = loss
             if loss < best_loss:
                 best_loss = loss
             wandb_logs['TRAIN/losses/best_loss'] = best_loss
 
             # making step
+
+            loss = loss.float()
             loss.backward()
             # TODO: grad accumulation
             clip_grad_norm_(slate.parameters(), args.clip, 'inf')
@@ -227,7 +251,7 @@ if __name__ == '__main__':
             if visualise:
                 slate.eval()
                 model.eval()
-                traj, actions = val_dataset[torch.randint(high=len(val_dataset), size=(1,))]
+                traj, actions, rew = val_dataset[torch.randint(high=len(val_dataset), size=(1,))]
                 traj = torch.tensor(traj)
                 traj = traj.to(torch.float)
                 traj = traj.to('cuda')
@@ -247,6 +271,15 @@ if __name__ == '__main__':
                     sample = slate.reconstruct_slots(slots)
                     sample = torch.clamp(sample, 0, 1)
 
+                    # let sampled_actions be actions from model
+                    # let sampled_slots be slots from
+                    # crop = (35, 190)
+                    # warmstart = 58
+                    # env = gym.make('PongDeterministic-v4')
+                    # sampled_slots = slots
+                    # sampled_actions = env.action_space.sample()
+                    # actions =
+
                     #  logging pictures
                     vis = torch.cat((ground_vis, recon_vis, gen_img_vis, sample), dim=0)
                     vis = vis.view(-1, 3, args.image_size, args.image_size)
@@ -257,15 +290,6 @@ if __name__ == '__main__':
                     wandb_logs['VIS/results'] = wandb.Image(grid)
                     wandb_logs['VIS/attns'] = wandb.Image(attns_grid)
 
-                    # EVAL
-                    vi, vmse, vce = 0, 0, 0
-                    for traj_batch, (trajs, actions) in enumerate(val_loader):
-                        recon, cross_entropy, mse, attns, slots = slate.diffusion_forward(pic_batch, tau, args.hard)
-                        vi += 1
-                        vmse += mse.detach().cpu().numpy()
-                        vce += cross_entropy.detach().cpu().numpy()
-                    wandb_logs['VAL/losses/q-vae_mse'] = vmse/vi
-                    wandb_logs['VAL/losses/slate_cross_entropy'] = vce/vi
 
                 slate.train()
                 model.train()

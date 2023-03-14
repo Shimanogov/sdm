@@ -1,6 +1,6 @@
 container:
   image: "sdm:latest"
-  command: 'python train_all.py --data_path=/sdm/c-swm/data/pong_train_10k.h5 --batch_size=2 --num_slots=4 --attn_init_mode=same_init --action_emb=4 --slot_size=16 --diff_size=64 --lr_diffusion=0.0001 --optimizer=adam'
+  command: 'python train_all_value.py --data_path=/sdm/c-swm/data/r_pong_train_1k.h5 --batch_size=4 --num_slots=6 --attn_init_mode=same_init --action_emb=8 --slot_size=16 --diff_size=64 --lr_diffusion=0.0001 --optimizer=adam'
   tty: True
   environment:
     - "WANDB_API_KEY=b76f4ea2608633bae37277fdb7dea46c4abdb63b"

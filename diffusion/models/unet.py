@@ -104,3 +104,4 @@ class TemporalUnet(nn.Module):
 
         x = einops.rearrange(x, 'b t h -> b h t')
         return x
+

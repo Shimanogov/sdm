@@ -129,3 +129,31 @@ class GaussianDiffusion(Module):
                 condition_noised = condition_tensor
             x = (1 - condition_mask) * x + condition_mask * condition_noised
         return torch.swapaxes(x, 0, 1)
+
+class GuidedGaussianDiffusion(GaussianDiffusion):
+    def __init__(
+            self,
+            value_model,
+            n_timesteps=1000,
+            loss_type='MSE',
+            device='cuda',
+    ):
+        super(GuidedGaussianDiffusion, self).__init__(value_model, n_timesteps, loss_type, device)
+
+    def p_losses(self, x, t, rew):
+        noise = torch.randn_like(x)
+
+        x_noisy = self.q_sample(x=x, t=t, noise=noise)
+        noise_pred = self.model(x_noisy, t).flo
+
+        loss = self.loss_fn(noise_pred, rew)
+
+        return loss
+
+    def loss(self, x, rew, return_t=False):
+        batch_size = len(x)
+        t = torch.randint(0, self.n_timesteps, (batch_size,)).to(self.device)
+        p_losses = self.p_losses(x, t, rew)
+        if return_t:
+            return p_losses, t
+        return p_losses
